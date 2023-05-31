@@ -1,160 +1,215 @@
-import { ObjectID } from 'mongodb';
-import fs from 'fs';
-import { v4 as uuidv4 } from 'uuid';
-import Queue from 'bull';
-import { findUserIdByToken } from '../utils/helpers';
-import dbClient from '../utils/db';
-import redisClient from '../utils/redis';
+import { existsSync, promises } from 'fs';
+import mime from 'mime-types';
+import { getCurrentUser } from '../utils/auth';
+import File, { FOLDER, FilesCollection } from '../utils/file';
+import fileQueue from '../worker';
 
+const { readFile } = promises;
+
+/**
+ * FilesController class to manage user files
+ */
 class FilesController {
   /**
-   * Should create a new file in DB and in disk
+   * Handles uploading a file by creating a new File object and saving it to
+   * the database.
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @return {Object} The saved file as a JSON object, or an error message as a
+   * JSON object.
    */
   static async postUpload(request, response) {
-    const fileQueue = new Queue('fileQueue');
-    // Retrieve the user based on the token
-    const userId = await findUserIdByToken(request);
-    if (!userId) return response.status(401).json({ error: 'Unauthorized' });
+    const currentUser = await getCurrentUser(request);
 
-    let fileInserted;
-
-    // Validate the request data
-    const { name } = request.body;
-    if (!name) return response.status(400).json({ error: 'Missing name' });
-    const { type } = request.body;
-    if (!type || !['folder', 'file', 'image'].includes(type)) { return response.status(400).json({ error: 'Missing type' }); }
-
-    const isPublic = request.body.isPublic || false;
-    const parentId = request.body.parentId || 0;
-    const { data } = request.body;
-    if (!data && !['folder'].includes(type)) { return response.status(400).json({ error: 'Missing data' }); }
-    // parentId (optional) as ID of the parent (default 0-> root)
-    if (parentId !== 0) {
-      const parentFileArray = await dbClient.files.find({ _id: ObjectID(parentId) }).toArray();
-      if (parentFileArray.length === 0) return response.status(400).json({ error: 'Parent not found' });
-      const file = parentFileArray[0];
-      if (file.type !== 'folder') return response.status(400).json({ error: 'Parent is not a folder' });
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
     }
 
-    // if no data, and not a folder, error
-    if (!data && type !== 'folder') return response.status(400).json({ error: 'Missing Data' });
+    const {
+      name, type, parentId, isPublic, data,
+    } = request.body;
 
-    // if type is folder then insert into DB, owner is ObjectID(userId)
-    if (type === 'folder') {
-      fileInserted = await dbClient.files.insertOne({
-        userId: ObjectID(userId),
-        name,
-        type,
-        isPublic,
-        parentId: parentId === 0 ? parentId : ObjectID(parentId),
-      });
-    // if not folder, store file in DB unscrambled
-    } else {
-      // Create a folder for this file
-      const folderPath = process.env.FOLDER_PATH || '/tmp/files_manager';
-      if (!fs.existsSync(folderPath)) fs.mkdirSync(folderPath, { recursive: true }, () => {});
-      // the actual location is the root computer 'C:/tmp/files_manager
-
-      // Create an ID and a new path to the new file
-      const filenameUUID = uuidv4();
-      const localPath = `${folderPath}/${filenameUUID}`;
-
-      // Unscramble data and write to new path
-      const clearData = Buffer.from(data, 'base64');
-      await fs.promises.writeFile(localPath, clearData.toString(), { flag: 'w+' });
-      await fs.readdirSync('/').forEach((file) => {
-        console.log(file);
-      });
-
-      // Insert into the DB
-      fileInserted = await dbClient.files.insertOne({
-        userId: ObjectID(userId),
-        name,
-        type,
-        isPublic,
-        parentId: parentId === 0 ? parentId : ObjectID(parentId),
-        localPath,
-      });
-
-      // if the file is an image, save it in binary
-      if (type === 'image') {
-        await fs.promises.writeFile(localPath, clearData, { flag: 'w+', encoding: 'binary' });
-        await fileQueue.add({ userId, fileId: fileInserted.insertedId, localPath });
+    try {
+      const file = new File(
+        currentUser.id, name, type, parentId, isPublic, data,
+      );
+      const savedFile = await file.save();
+      if (savedFile.type === 'image') {
+        fileQueue.add({
+          userId: currentUser.id,
+          fileId: savedFile.id,
+        });
       }
+      return response.status(201).json(savedFile);
+    } catch (error) {
+      return response.status(400).json({
+        error: error.message,
+      });
+    }
+  }
+
+  /**
+   * Returns a JSON response containing a file with the given id, if it belongs
+   * to the current user.
+   *
+   * @param {Object} request - the HTTP request object
+   * @param {Object} response - the HTTP response object
+   * @return {Promise<Object>} - a JSON response containing the file, or an
+   * error message
+   */
+  static async getShow(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
     }
 
-    // Return the new file with a status code 201
-    return response.status(201).json({
-      id: fileInserted.ops[0]._id, userId, name, type, isPublic, parentId,
-    });
+    const { id } = request.params;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.findUserFileById(currentUser.id, id);
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    return response.status(200).json(file);
   }
 
-  // GET /files/:id
-  // Return file by fileId
-  static async getShow(request, response) {
-    // Retrieve the user based on the token
-    const token = request.headers['x-token'];
-    if (!token) { return response.status(401).json({ error: 'Unauthorized' }); }
-    const keyID = await redisClient.get(`auth_${token}`);
-    if (!keyID) { return response.status(401).json({ error: 'Unauthorized' }); }
-    const user = await dbClient.db.collection('users').findOne({ _id: ObjectID(keyID) });
-    if (!user) { return response.status(401).json({ error: 'Unauthorized' }); }
-
-    const idFile = request.params.id || '';
-    const fileDocument = await dbClient.db
-      .collection('files')
-      .findOne({ _id: ObjectID(idFile), userId: user._id });
-    if (!fileDocument) return response.status(404).send({ error: 'Not found' });
-
-    return response.send({
-      id: fileDocument._id,
-      userId: fileDocument.userId,
-      name: fileDocument.name,
-      type: fileDocument.type,
-      isPublic: fileDocument.isPublic,
-      parentId: fileDocument.parentId,
-    });
-  }
-
-  // GET /files
-  // Return the files attached to the user
+  /**
+   * Retrieves a list of files belonging to the current user, filtered by
+   * `parentId` and `page`.
+   *
+   * @param {Object} request - The request object containing query parameters.
+   * @param {Object} response - The response object to send the list of files.
+   * @return {Object} The HTTP response object with status code 200 and a JSON
+   * array of files.
+   */
   static async getIndex(request, response) {
-    // Retrieve the user based on the token
-    const token = request.headers['x-token'];
-    if (!token) { return response.status(401).json({ error: 'Unauthorized' }); }
-    const keyID = await redisClient.get(`auth_${token}`);
-    if (!keyID) { return response.status(401).json({ error: 'Unauthorized' }); }
-    const parentId = request.query.parentId || '0';
-    const pagination = request.query.page || 0;
-    const user = await dbClient.db.collection('users').findOne({ _id: ObjectID(keyID) });
-    if (!user) response.status(401).json({ error: 'Unauthorized' });
+    const currentUser = await getCurrentUser(request);
 
-    const aggregationMatch = { $and: [{ parentId }] };
-    let aggregateData = [
-      { $match: aggregationMatch },
-      { $skip: pagination * 20 },
-      { $limit: 20 },
-    ];
-    if (parentId === 0) aggregateData = [{ $skip: pagination * 20 }, { $limit: 20 }];
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
 
-    const files = await dbClient.db
-      .collection('files')
-      .aggregate(aggregateData);
-    const filesArray = [];
-    await files.forEach((item) => {
-      const fileItem = {
-        id: item._id,
-        userId: item.userId,
-        name: item.name,
-        type: item.type,
-        isPublic: item.isPublic,
-        parentId: item.parentId,
-      };
-      filesArray.push(fileItem);
-    });
+    let { parentId, page } = request.query;
+    if (parentId === '0' || !parentId) parentId = 0;
+    page = Number.isNaN(page) ? 0 : Number(page);
 
-    return response.send(filesArray);
+    const filesCollection = new FilesCollection();
+    const files = await filesCollection.findAllUserFilesByParentId(
+      currentUser.id,
+      parentId,
+      page,
+    );
+
+    return response.status(200).json(files);
+  }
+
+  /**
+   * Executes an asynchronous method to publish a file.
+   *
+   * @param {Object} request - An object containing the request data.
+   * @param {Object} response - An object containing the response data.
+   * @return {Promise} A promise that resolves to the updated publication object.
+   */
+  static async putPublish(request, response) {
+    return FilesController.updatePublication(request, response, true);
+  }
+
+  /**
+   * Executes an asynchronous method to unpublish a file.
+   *
+   * @param {Object} request - the request object
+   * @param {Object} response - the response object
+   * @return {Promise} - a Promise that resolves with the updated publication
+   */
+  static async putUnpublish(request, response) {
+    return FilesController.updatePublication(request, response, false);
+  }
+
+  /**
+   * Updates the publication status of a file.
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @param {boolean} isPublished - The new publication status of the file.
+   * @return {Object} The updated file object as a JSON response.
+   */
+  static async updatePublication(request, response, isPublished) {
+    const currentUser = await getCurrentUser(request);
+
+    if (!currentUser) {
+      return response.status(401).json({
+        error: 'Unauthorized',
+      });
+    }
+    const { id } = request.params;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.updateFilePublication(
+      currentUser.id, id, isPublished,
+    );
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+    return response.status(200).json(file);
+  }
+
+  /**
+   * Retrieves a file from the server given a file id and sends it as a response
+   *
+   * @param {Object} request - The HTTP request object.
+   * @param {Object} response - The HTTP response object.
+   * @return {Promise} Resolves with the file data, or rejects with an error
+   * message.
+   */
+  static async getFile(request, response) {
+    const currentUser = await getCurrentUser(request);
+
+    const { id } = request.params;
+    const { size } = request.query;
+    const filesCollection = new FilesCollection();
+    const file = await filesCollection.findPublicOrOwnFile(
+      currentUser ? currentUser.id : null,
+      id,
+    );
+    if (!file) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    if (file.type === FOLDER) {
+      return response.status(400).json({
+        error: "A folder doesn't have content",
+      });
+    }
+
+    let filePath = file.localPath;
+    if (!Number.isNaN(size) && [500, 250, 100].includes(Number(size))) {
+      filePath += `_${size}`;
+    }
+
+    if (!existsSync(filePath)) {
+      return response.status(404).json({
+        error: 'Not found',
+      });
+    }
+
+    const mimeType = mime.lookup(file.name);
+    response.set('Content-Type', mimeType);
+    const data = await readFile(filePath);
+    return response.status(200).send(data);
   }
 }
 
-module.exports = FilesController;
+export default FilesController;
